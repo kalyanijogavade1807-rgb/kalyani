@@ -1,0 +1,5 @@
+streamlit>=1.33
+chromadb>=0.5
+sentence-transformers>=2.7
+pypdf>=4.2
+openai>=1.30
