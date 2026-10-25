@@ -3,7 +3,7 @@ import tempfile
 import streamlit as st
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
 from openai import OpenAI
 
@@ -28,9 +28,6 @@ st.markdown("""
         font-size: 1.1rem;
         color: #4B5563;
         margin-bottom: 2rem;
-    }
-    .stChatBox {
-        background-color: #F9FAFB;
     }
     .source-box {
         background-color: #F3F4F6;
@@ -74,10 +71,9 @@ def load_document(uploaded_file):
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
-def process_documents(documents):
-    """Splits documents and creates ChromaDB vector store with HuggingFace embeddings."""
+def process_documents(documents, api_key):
+    """Splits documents and creates ChromaDB vector store using OpenAI embeddings."""
     try:
-        # Split text into 500-character chunks with 80-character overlap
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=500,
             chunk_overlap=80,
@@ -90,10 +86,12 @@ def process_documents(documents):
             st.error("No text could be extracted from the uploaded document.")
             return None
 
-        # Use lightweight local embeddings (no API key required for embeddings)
-        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        # Lightweight, cloud-safe OpenAI embeddings
+        embeddings = OpenAIEmbeddings(
+            model="text-embedding-3-small",
+            openai_api_key=api_key
+        )
         
-        # Store in ChromaDB (in-memory persistent client)
         vectorstore = Chroma.from_documents(
             documents=chunks,
             embedding=embeddings
@@ -106,13 +104,12 @@ def process_documents(documents):
 # --- Sidebar Configuration ---
 with st.sidebar:
     st.markdown("## ⚙️ Administration")
-    st.markdown("Upload your campus handbook or academic policy document.")
     
     api_key_input = st.text_input(
         "OpenAI API Key",
         type="password",
         placeholder="sk-...",
-        help="Required for answering student questions via GPT model."
+        help="Required for document embeddings and answering questions."
     )
     
     model_choice = st.selectbox(
@@ -130,22 +127,25 @@ with st.sidebar:
     
     if uploaded_file is not None:
         if st.button("Process Document", type="primary", use_container_width=True):
-            with st.spinner("Processing policy document and building vector database..."):
-                docs = load_document(uploaded_file)
-                if docs:
-                    vstore = process_documents(docs)
-                    if vstore:
-                        st.session_state.vectorstore = vstore
-                        st.session_state.doc_processed = True
-                        st.session_state.messages = []
-                        st.success("Document successfully processed and indexed in ChromaDB!")
+            if not api_key_input:
+                st.error("Please enter your OpenAI API Key before processing.")
+            else:
+                with st.spinner("Processing policy document and building vector database..."):
+                    docs = load_document(uploaded_file)
+                    if docs:
+                        vstore = process_documents(docs, api_key_input)
+                        if vstore:
+                            st.session_state.vectorstore = vstore
+                            st.session_state.doc_processed = True
+                            st.session_state.messages = []
+                            st.success("Document successfully processed and indexed in ChromaDB!")
 
     st.markdown("---")
-    st.markdown("### 📌 Guidelines")
+    st.markdown("### 📌 Configuration")
     st.markdown("""
     - **Chunk Size:** 500 characters
     - **Overlap:** 80 characters
-    - **Embeddings:** `all-MiniLM-L6-v2`
+    - **Embeddings:** `text-embedding-3-small`
     - **Vector Store:** ChromaDB
     """)
 
@@ -153,46 +153,41 @@ with st.sidebar:
 st.markdown('<p class="main-header">🎓 Campus Rulebook QA Assistant</p>', unsafe_allow_html=True)
 st.markdown('<p class="sub-header">Ask questions about campus policies, academic guidelines, and code of conduct—grounded strictly in official documentation.</p>', unsafe_allow_html=True)
 
-# Check if vector store is ready
 if not st.session_state.doc_processed or st.session_state.vectorstore is None:
-    st.info("👈 Please upload an academic policy PDF or text handbook in the sidebar and click **Process Document** to begin.")
+    st.info("👈 Please enter your OpenAI API Key, upload an academic policy PDF or text handbook in the sidebar, and click **Process Document** to begin.")
 else:
-    # Display chat history
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             if "sources" in message and message["sources"]:
                 with st.expander("📚 View Source Quotes & Citations"):
                     for i, source in enumerate(message["sources"]):
+                        page_num = source.metadata.get('page', 0) + 1 if 'page' in source.metadata else 'N/A'
                         st.markdown(f"""
                         <div class="source-box">
-                            <b>Source Chunk {i+1}</b> (Page {source.metadata.get('page', 'N/A') if hasattr(source, 'metadata') else 'N/A'}):<br>
+                            <b>Source Chunk {i+1}</b> (Page {page_num}):<br>
                             {source.page_content}
                         </div>
                         """, unsafe_allow_html=True)
 
-    # Chat Input
     if prompt := st.chat_input("Ask a question about the campus rulebook..."):
         if not api_key_input:
             st.error("Please enter your OpenAI API Key in the sidebar to ask questions.")
         else:
-            # Append user message
             st.session_state.messages.append({"role": "user", "content": prompt})
             with st.chat_message("user"):
                 st.markdown(prompt)
 
-            # Retrieve relevant chunks from ChromaDB
             with st.spinner("Searching policy rulebook..."):
                 try:
                     retriever = st.session_state.vectorstore.as_retriever(
                         search_kwargs={"k": 4}
                     )
-                    retrieved_docs = retriever.get_relevant_documents(prompt)
+                    retrieved_docs = retriever.invoke(prompt)
                 except Exception as e:
                     st.error(f"Retrieval error: {str(e)}")
                     retrieved_docs = []
 
-            # Construct context from retrieved documents
             context_text = "\n\n".join([doc.page_content for doc in retrieved_docs])
 
             system_prompt = f"""You are the Campus Rulebook QA Assistant, an official AI helper for college students and staff.
@@ -204,10 +199,8 @@ Context Excerpts:
 {context_text}
 """
 
-            # Call OpenAI API
             try:
                 client = OpenAI(api_key=api_key_input)
-                
                 response = client.chat.completions.create(
                     model=model_choice,
                     messages=[
@@ -216,20 +209,17 @@ Context Excerpts:
                     ],
                     temperature=0.0
                 )
-                
                 assistant_response = response.choices[0].message.content
-
             except Exception as e:
                 assistant_response = f"An error occurred while communicating with the OpenAI API: {str(e)}"
                 retrieved_docs = []
 
-            # Display assistant response
             with st.chat_message("assistant"):
                 st.markdown(assistant_response)
                 if retrieved_docs:
                     with st.expander("📚 View Source Quotes & Citations"):
                         for i, doc in enumerate(retrieved_docs):
-                            page_num = doc.metadata.get('page', 'N/A') + 1 if 'page' in doc.metadata else 'N/A'
+                            page_num = doc.metadata.get('page', 0) + 1 if 'page' in doc.metadata else 'N/A'
                             st.markdown(f"""
                             <div class="source-box">
                                 <b>Source Chunk {i+1}</b> (Page {page_num}):<br>
@@ -237,7 +227,6 @@ Context Excerpts:
                             </div>
                             """, unsafe_allow_html=True)
 
-            # Save assistant message to history
             st.session_state.messages.append({
                 "role": "assistant",
                 "content": assistant_response,
