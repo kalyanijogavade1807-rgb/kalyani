@@ -1,369 +1,245 @@
-import hashlib
-import io
 import os
-import re
-import uuid
-from typing import Any
-
-import chromadb
+import tempfile
 import streamlit as st
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
 from openai import OpenAI
-from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer
 
-
-APP_TITLE = "Campus Rulebook QA Assistant"
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 80
-TOP_K = 4
-
+# Page Configuration
 st.set_page_config(
-    page_title=APP_TITLE,
+    page_title="Campus Rulebook QA Assistant",
     page_icon="🎓",
-    layout="centered",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-st.markdown(
-    """
-    <style>
-    .stApp {
-        background: linear-gradient(180deg, #f6f8fc 0%, #ffffff 46%);
+# Custom Styling
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.2rem;
+        color: #1E3A8A;
+        font-weight: 700;
+        margin-bottom: 0.2rem;
     }
-    .block-container {
-        max-width: 900px;
-        padding-top: 2.5rem;
-        padding-bottom: 4rem;
+    .sub-header {
+        font-size: 1.1rem;
+        color: #4B5563;
+        margin-bottom: 2rem;
     }
-    [data-testid="stSidebar"] {
-        background-color: #f0f4fa;
+    .stChatBox {
+        background-color: #F9FAFB;
     }
-    .hero {
-        padding: 1.4rem 1.6rem;
-        border: 1px solid #e3eaf5;
-        border-radius: 18px;
-        background: linear-gradient(120deg, #ffffff, #eef5ff);
-        margin-bottom: 1.5rem;
+    .source-box {
+        background-color: #F3F4F6;
+        border-left: 4px solid #3B82F6;
+        padding: 10px;
+        margin: 5px 0px;
+        font-size: 0.9rem;
+        color: #374151;
+        border-radius: 4px;
     }
-    .hero h1 {
-        margin: 0 0 0.35rem 0;
-        color: #17345c;
-        font-size: 2rem;
-    }
-    .hero p {
-        margin: 0;
-        color: #52647d;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+</style>
+""", unsafe_allow_html=True)
 
-
-@st.cache_resource(show_spinner="Loading the local embedding model...")
-def load_embedding_model() -> SentenceTransformer:
-    return SentenceTransformer(EMBEDDING_MODEL_NAME)
-
-
-def get_chroma_client() -> chromadb.ClientAPI:
-    if "chroma_client" not in st.session_state:
-        st.session_state.chroma_client = chromadb.EphemeralClient()
-    return st.session_state.chroma_client
-
-
-def read_handbook(uploaded_file: Any) -> list[tuple[int, str]]:
-    """Return non-empty page/text pairs; plain-text handbooks are page 1."""
-    content = uploaded_file.getvalue()
-    filename = uploaded_file.name.lower()
-
-    if filename.endswith(".pdf"):
-        try:
-            reader = PdfReader(io.BytesIO(content))
-            if reader.is_encrypted:
-                raise ValueError("This PDF is password-protected. Upload an unlocked copy.")
-            pages = []
-            for page_number, page in enumerate(reader.pages, start=1):
-                text = page.extract_text() or ""
-                if text.strip():
-                    pages.append((page_number, text))
-            return pages
-        except ValueError:
-            raise
-        except Exception as exc:
-            raise ValueError(f"Could not read this PDF: {exc}") from exc
-
-    try:
-        return [(1, content.decode("utf-8-sig"))]
-    except UnicodeDecodeError as exc:
-        raise ValueError("Could not decode this text file as UTF-8.") from exc
-
-
-def split_pages(pages: list[tuple[int, str]]) -> list[dict[str, Any]]:
-    chunks: list[dict[str, Any]] = []
-    step = CHUNK_SIZE - CHUNK_OVERLAP
-
-    for page_number, page_text in pages:
-        text = re.sub(r"\s+", " ", page_text).strip()
-        for start in range(0, len(text), step):
-            chunk = text[start : start + CHUNK_SIZE].strip()
-            if chunk:
-                chunks.append({"text": chunk, "page": page_number})
-
-    return chunks
-
-
-def index_handbook(uploaded_file: Any) -> tuple[str, int]:
-    pages = read_handbook(uploaded_file)
-    chunks = split_pages(pages)
-    if not chunks:
-        raise ValueError(
-            "No readable text was found. If this is a scanned PDF, run OCR and upload it again."
-        )
-
-    model = load_embedding_model()
-    client = get_chroma_client()
-    collection_name = f"handbook_{uuid.uuid4().hex}"
-    collection = client.create_collection(
-        name=collection_name,
-        metadata={"hnsw:space": "cosine"},
-    )
-    try:
-        for batch_start in range(0, len(chunks), 128):
-            batch = chunks[batch_start : batch_start + 128]
-            embeddings = model.encode(
-                [item["text"] for item in batch],
-                normalize_embeddings=True,
-                show_progress_bar=False,
-            )
-            collection.add(
-                ids=[f"chunk_{batch_start + offset}" for offset in range(len(batch))],
-                documents=[item["text"] for item in batch],
-                embeddings=embeddings.tolist(),
-                metadatas=[
-                    {
-                        "page": item["page"],
-                        "source": uploaded_file.name,
-                    }
-                    for item in batch
-                ],
-            )
-    except Exception:
-        client.delete_collection(name=collection_name)
-        raise
-
-    previous_collection = st.session_state.get("collection_name")
-    st.session_state.collection_name = collection_name
-    st.session_state.document_name = uploaded_file.name
-    st.session_state.document_hash = hashlib.sha256(
-        uploaded_file.getvalue()
-    ).hexdigest()
-    st.session_state.chunk_count = len(chunks)
+# Initialize Session State
+if "vectorstore" not in st.session_state:
+    st.session_state.vectorstore = None
+if "messages" not in st.session_state:
     st.session_state.messages = []
+if "doc_processed" not in st.session_state:
+    st.session_state.doc_processed = False
 
-    if previous_collection:
-        try:
-            client.delete_collection(name=previous_collection)
-        except Exception as exc:
-            st.warning(f"The previous index could not be cleared: {exc}")
-
-    return uploaded_file.name, len(chunks)
-
-
-def get_api_key() -> str:
-    entered_key = st.session_state.get("openai_api_key_input", "").strip()
-    if entered_key:
-        return entered_key
+def load_document(uploaded_file):
+    """Loads uploaded PDF or TXT file into LangChain documents."""
+    file_extension = os.path.splitext(uploaded_file.name)[1].lower()
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp_file:
+        tmp_file.write(uploaded_file.getvalue())
+        tmp_path = tmp_file.name
 
     try:
-        configured_key = st.secrets.get("OPENAI_API_KEY", "")
-        if configured_key:
-            return str(configured_key).strip()
-    except (FileNotFoundError, AttributeError):
-        pass
+        if file_extension == ".pdf":
+            loader = PyPDFLoader(tmp_path)
+            documents = loader.load()
+        elif file_extension == ".txt":
+            loader = TextLoader(tmp_path, encoding="utf-8")
+            documents = loader.load()
+        else:
+            raise ValueError("Unsupported file format. Please upload a PDF or TXT file.")
+        return documents
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
-    return os.getenv("OPENAI_API_KEY", "").strip()
-
-
-def answer_question(question: str, collection: Any, api_key: str) -> tuple[str, list[dict[str, Any]]]:
-    model = load_embedding_model()
-    query_embedding = model.encode(
-        question,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    ).tolist()
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=min(TOP_K, collection.count()),
-        include=["documents", "metadatas", "distances"],
-    )
-
-    documents = results.get("documents", [[]])[0]
-    metadatas = results.get("metadatas", [[]])[0]
-    sources = [
-        {
-            "label": f"S{index + 1}",
-            "text": document,
-            "page": metadata.get("page"),
-            "source": metadata.get("source", st.session_state.document_name),
-        }
-        for index, (document, metadata) in enumerate(zip(documents, metadatas))
-    ]
-    if not sources:
-        raise ValueError("No passages were retrieved. Try reprocessing the handbook.")
-
-    evidence = "\n\n".join(
-        f"[{source['label']}] (page {source['page']}) {source['text']}"
-        for source in sources
-    )
-    client = OpenAI(api_key=api_key)
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You answer student questions about the campus handbook. "
-                    "Use only the supplied evidence. Do not use outside knowledge, "
-                    "make assumptions, or infer facts not stated in the evidence. "
-                    "If the evidence does not explicitly answer the question, say: "
-                    "\"I couldn't find that information in the uploaded handbook.\" "
-                    "For every factual statement, cite supporting evidence using its "
-                    "label, such as [S1]. Keep the answer clear and concise."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Handbook evidence:\n{evidence}\n\nQuestion: {question}",
-            },
-        ],
-    )
-    answer = response.choices[0].message.content
-    if not answer:
-        raise RuntimeError("The answer service returned an empty response.")
-    return answer, sources
-
-
-st.markdown(
-    f"""
-    <div class="hero">
-      <h1>🎓 {APP_TITLE}</h1>
-      <p>Ask questions about your campus handbook and get answers grounded in its text.</p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-with st.sidebar:
-    st.subheader("Set up your handbook")
-    uploaded_file = st.file_uploader(
-        "Upload an academic policy",
-        type=["pdf", "txt"],
-        help="PDF and UTF-8 text handbooks are supported.",
-    )
-    process_clicked = st.button(
-        "Process handbook",
-        type="primary",
-        disabled=uploaded_file is None,
-        use_container_width=True,
-    )
-    st.divider()
-    st.subheader("Answer service")
-    st.caption("An OpenAI API key is required to generate answers.")
-    st.text_input(
-        "OpenAI API key",
-        type="password",
-        key="openai_api_key_input",
-        placeholder="sk-...",
-        help="Alternatively, set OPENAI_API_KEY in your environment or Streamlit secrets.",
-    )
-
-if process_clicked and uploaded_file is not None:
-    with st.spinner("Reading, chunking, embedding, and indexing the handbook..."):
-        try:
-            filename, chunk_count = index_handbook(uploaded_file)
-            st.sidebar.success(f"Indexed {filename} into {chunk_count} chunks.")
-        except Exception as exc:
-            st.error(f"Could not process the handbook: {exc}")
-
-if st.session_state.get("collection_name"):
-    st.caption(
-        f"📘 **{st.session_state.document_name}** · "
-        f"{st.session_state.chunk_count} searchable chunks"
-    )
-    if not get_api_key():
-        st.info(
-            "Add your OpenAI API key in the sidebar to ask questions. "
-            "Your handbook is already indexed locally for this session."
+def process_documents(documents):
+    """Splits documents and creates ChromaDB vector store with HuggingFace embeddings."""
+    try:
+        # Split text into 500-character chunks with 80-character overlap
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500,
+            chunk_overlap=80,
+            length_function=len,
+            is_separator_regex=False,
         )
+        chunks = text_splitter.split_documents(documents)
+        
+        if not chunks:
+            st.error("No text could be extracted from the uploaded document.")
+            return None
 
-    for message in st.session_state.get("messages", []):
+        # Use lightweight local embeddings (no API key required for embeddings)
+        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        
+        # Store in ChromaDB (in-memory persistent client)
+        vectorstore = Chroma.from_documents(
+            documents=chunks,
+            embedding=embeddings
+        )
+        return vectorstore
+    except Exception as e:
+        st.error(f"Error processing document: {str(e)}")
+        return None
+
+# --- Sidebar Configuration ---
+with st.sidebar:
+    st.markdown("## ⚙️ Administration")
+    st.markdown("Upload your campus handbook or academic policy document.")
+    
+    api_key_input = st.text_input(
+        "OpenAI API Key",
+        type="password",
+        placeholder="sk-...",
+        help="Required for answering student questions via GPT model."
+    )
+    
+    model_choice = st.selectbox(
+        "Select LLM Model",
+        ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"],
+        index=0
+    )
+    
+    st.markdown("---")
+    uploaded_file = st.file_uploader(
+        "Upload Policy Handbook",
+        type=["pdf", "txt"],
+        help="Upload a PDF or TXT campus policy document."
+    )
+    
+    if uploaded_file is not None:
+        if st.button("Process Document", type="primary", use_container_width=True):
+            with st.spinner("Processing policy document and building vector database..."):
+                docs = load_document(uploaded_file)
+                if docs:
+                    vstore = process_documents(docs)
+                    if vstore:
+                        st.session_state.vectorstore = vstore
+                        st.session_state.doc_processed = True
+                        st.session_state.messages = []
+                        st.success("Document successfully processed and indexed in ChromaDB!")
+
+    st.markdown("---")
+    st.markdown("### 📌 Guidelines")
+    st.markdown("""
+    - **Chunk Size:** 500 characters
+    - **Overlap:** 80 characters
+    - **Embeddings:** `all-MiniLM-L6-v2`
+    - **Vector Store:** ChromaDB
+    """)
+
+# --- Main Application Interface ---
+st.markdown('<p class="main-header">🎓 Campus Rulebook QA Assistant</p>', unsafe_allow_html=True)
+st.markdown('<p class="sub-header">Ask questions about campus policies, academic guidelines, and code of conduct—grounded strictly in official documentation.</p>', unsafe_allow_html=True)
+
+# Check if vector store is ready
+if not st.session_state.doc_processed or st.session_state.vectorstore is None:
+    st.info("👈 Please upload an academic policy PDF or text handbook in the sidebar and click **Process Document** to begin.")
+else:
+    # Display chat history
+    for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
-            if message.get("sources"):
-                with st.expander("📚 View retrieved source quotes"):
-                    for source in message["sources"]:
-                        st.markdown(
-                            f"**[{source['label']}] {source['source']} · "
-                            f"page {source['page']}**"
-                        )
-                        st.markdown(f"> {source['text']}")
-            if message.get("error"):
-                st.error(message["error"])
+            if "sources" in message and message["sources"]:
+                with st.expander("📚 View Source Quotes & Citations"):
+                    for i, source in enumerate(message["sources"]):
+                        st.markdown(f"""
+                        <div class="source-box">
+                            <b>Source Chunk {i+1}</b> (Page {source.metadata.get('page', 'N/A') if hasattr(source, 'metadata') else 'N/A'}):<br>
+                            {source.page_content}
+                        </div>
+                        """, unsafe_allow_html=True)
 
-    question = st.chat_input("Ask a question about the handbook...")
-    if question:
-        st.session_state.messages.append({"role": "user", "content": question})
-        with st.chat_message("user"):
-            st.markdown(question)
+    # Chat Input
+    if prompt := st.chat_input("Ask a question about the campus rulebook..."):
+        if not api_key_input:
+            st.error("Please enter your OpenAI API Key in the sidebar to ask questions.")
+        else:
+            # Append user message
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
 
-        with st.chat_message("assistant"):
-            api_key = get_api_key()
-            if not api_key:
-                message_text = "Please add an OpenAI API key in the sidebar before asking a question."
-                st.warning(message_text)
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": message_text}
-                )
-            else:
+            # Retrieve relevant chunks from ChromaDB
+            with st.spinner("Searching policy rulebook..."):
                 try:
-                    collection = get_chroma_client().get_collection(
-                        name=st.session_state.collection_name
+                    retriever = st.session_state.vectorstore.as_retriever(
+                        search_kwargs={"k": 4}
                     )
-                    with st.spinner("Searching the handbook and preparing an answer..."):
-                        answer, sources = answer_question(question, collection, api_key)
-                    st.markdown(answer)
-                    with st.expander("📚 View retrieved source quotes"):
-                        for source in sources:
-                            st.markdown(
-                                f"**[{source['label']}] {source['source']} · "
-                                f"page {source['page']}**"
-                            )
-                            st.markdown(f"> {source['text']}")
-                    st.session_state.messages.append(
-                        {
-                            "role": "assistant",
-                            "content": answer,
-                            "sources": sources,
-                        }
-                    )
-                except Exception as exc:
-                    error_text = f"Could not generate an answer: {exc}"
-                    st.error(error_text)
-                    st.session_state.messages.append(
-                        {
-                            "role": "assistant",
-                            "content": "I couldn't complete that request.",
-                            "error": error_text,
-                        }
-                    )
-else:
-    st.info("Upload a campus policy PDF or text handbook in the sidebar to get started.")
-    st.markdown(
-        """
-        **How it works**
-        1. Upload and index a PDF or text handbook.
-        2. Ask a question in the chat.
-        3. Review the cited source quotes alongside each answer.
-        """
-    )
+                    retrieved_docs = retriever.get_relevant_documents(prompt)
+                except Exception as e:
+                    st.error(f"Retrieval error: {str(e)}")
+                    retrieved_docs = []
+
+            # Construct context from retrieved documents
+            context_text = "\n\n".join([doc.page_content for doc in retrieved_docs])
+
+            system_prompt = f"""You are the Campus Rulebook QA Assistant, an official AI helper for college students and staff.
+Your task is to answer user questions strictly based on the provided policy document excerpts below. 
+If the answer cannot be found in the provided context, state clearly: "I cannot find the answer to this question in the provided campus rulebook."
+Do not make up, infer, or extrapolate information outside the provided text. Always remain objective and accurate.
+
+Context Excerpts:
+{context_text}
+"""
+
+            # Call OpenAI API
+            try:
+                client = OpenAI(api_key=api_key_input)
+                
+                response = client.chat.completions.create(
+                    model=model_choice,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.0
+                )
+                
+                assistant_response = response.choices[0].message.content
+
+            except Exception as e:
+                assistant_response = f"An error occurred while communicating with the OpenAI API: {str(e)}"
+                retrieved_docs = []
+
+            # Display assistant response
+            with st.chat_message("assistant"):
+                st.markdown(assistant_response)
+                if retrieved_docs:
+                    with st.expander("📚 View Source Quotes & Citations"):
+                        for i, doc in enumerate(retrieved_docs):
+                            page_num = doc.metadata.get('page', 'N/A') + 1 if 'page' in doc.metadata else 'N/A'
+                            st.markdown(f"""
+                            <div class="source-box">
+                                <b>Source Chunk {i+1}</b> (Page {page_num}):<br>
+                                {doc.page_content}
+                            </div>
+                            """, unsafe_allow_html=True)
+
+            # Save assistant message to history
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": assistant_response,
+                "sources": retrieved_docs
+            })

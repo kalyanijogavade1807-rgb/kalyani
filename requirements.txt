@@ -1,5 +1,7 @@
-streamlit>=1.33
-chromadb>=0.5
-sentence-transformers>=2.7
-pypdf>=4.2
-openai>=1.30
+streamlit==1.32.0
+langchain==0.1.16
+langchain-community==0.0.32
+chromadb==0.4.24
+sentence-transformers==2.6.1
+pypdf==4.1.0
+openai==1.14.2
